@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Two builds, one per FanControl build:
+      net48           FanControl's .NET Framework 4.8 build (FanControl.exe + FanControl.exe.config)
+      net8.0-windows  FanControl's .NET 8 / .NET 10 builds (FanControl.dll + FanControl.runtimeconfig.json)
+  -->
+  <PropertyGroup>
+    <TargetFrameworks>net48;net8.0-windows</TargetFrameworks>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <AssemblyName>FanControl.Axb35</AssemblyName>
+    <RootNamespace>FanControl.Axb35</RootNamespace>
+    <Version>1.0.0</Version>
+    <Description>FanControl plugin for the ITE IT5570E EC on Sixunited AXB35 boards (Bosgame M5), via PawnIO</Description>
+    <Authors>Hardware Busters</Authors>
+    <Deterministic>true</Deterministic>
+    <PathMap>$(MSBuildProjectDirectory)=/_/</PathMap>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Axb35.Ec\*.cs" Link="Ec\%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\resources\LpcACPIEC.bin" LogicalName="Axb35.Ec.LpcACPIEC.bin" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'net48'">
+    <Reference Include="FanControl.Plugins">
+      <HintPath>..\..\lib\net48\FanControl.Plugins.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' != 'net48'">
+    <Reference Include="FanControl.Plugins">
+      <HintPath>..\..\lib\net10.0\FanControl.Plugins.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

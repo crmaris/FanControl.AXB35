@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/axb35ctl/axb35ctl.csproj" />
+    <Project Path="src/FanControl.Axb35/FanControl.Axb35.csproj" />
+  </Folder>
+</Solution>
