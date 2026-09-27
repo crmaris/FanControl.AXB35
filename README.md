@@ -11,7 +11,7 @@ sensor, the RPM of all three fans, and full 0-100 % control of fans 1 and 2. You
 It talks to the EC through **PawnIO**, the signed driver Fan Control itself installs. **Secure Boot and Memory
 Integrity (HVCI) stay on**, and there is no WinRing0 and no test-signing.
 
-Background and measurements: *Hardware Busters article (link added on publication).*
+Background and measurements: [Bosgame M5 Fan Control: Broken as Shipped, So I Fixed It With a Free Plugin](https://hwbusters.com/systems/bosgame-m5-fan-control-broken-as-shipped-so-i-fixed-it-with-a-free-plugin/) (Hardware Busters).
 
 ## Compatibility
 
@@ -71,13 +71,22 @@ log and stays read-only.
 4. Fan 3 (the small one) has no known control register. It is shown for monitoring only and stays on firmware
    control.
 
-Duty is continuous from 0 to 100 %. At 100 % both main fans reach about 4,400-4,500 rpm; the stock firmware held
-them at about 2,350-2,600 rpm with the chip at 72-78 °C.
+Duty is continuous from 0 to 80 %. **The plugin caps the EC at 80 %; Fan Control's 81-100 % all mean 80 %.**
+Measured on the test unit with the chip at 98 °C and all 32 threads loaded:
 
-**Know the limit.** In Performance mode, an all-core CPU load takes the chip to 97-98 °C in seconds whatever the
-fans do. At that point the fans on the test unit lost speed, falling to roughly 1,400-2,600 rpm and swinging,
-even while the plugin held them at 100 % and the EC's duty register read 100 %. The stock firmware does the same.
-The plugin cannot override it. It helps most below the limit, which covers GPU-heavy work such as LLM inference.
+| Command | Fan 1 | Fan 2 |
+|---|---|---|
+| Stock firmware | ~3,000 rpm | ~3,180 rpm |
+| 100 % (re-written every 2 s) | ~4,540 rpm | **~2,080 rpm, dipping to ~1,420** |
+| **80 % (re-written every 2 s)** | **~4,000 rpm, steady** | **~4,010 rpm, steady** |
+
+**At 100 % the board cannot keep both fans spinning once the chip is hot.** One of them, and it is not always the
+same one, repeatedly collapses to 1,400-2,000 rpm, even though the EC's duty register still reads 100 %. At 80 %
+both hold about 4,000 rpm. That is more combined airflow than 100 % gives, and far more than the stock firmware
+delivers. When cool, 100 % reaches about 4,400-4,500 rpm per fan.
+
+In Performance mode, an all-core CPU load still takes the chip into the high 90s °C whatever the fans do. The
+plugin buys headroom and airflow; it cannot beat the chip's power limit.
 
 ## Run it without logging in (optional)
 
@@ -122,6 +131,9 @@ Details that matter:
   threads were busy; the spin has not failed since.
 - **Re-assert.** The EC quietly takes a held fan back after a while, without changing the duty register. The plugin
   re-writes the duty every 2 s, as the Linux tool does.
+- **Lock order.** Thread priority is raised *before* the shared EC mutex is taken, so a holder is never preempted
+  mid-transaction on a saturated CPU while other EC users wait for it.
+- **80 % cap.** See the table above.
 - **Verified writes.** Every write is read back.
 - **Release.** When Fan Control stops or releases a fan, the plugin writes `0x00` and the fan goes back to the
   firmware's own curve. This was measured: after 100 % the fans decayed back to their firmware speed.

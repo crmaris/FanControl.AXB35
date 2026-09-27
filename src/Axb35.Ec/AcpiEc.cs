@@ -21,7 +21,7 @@ internal sealed class AcpiEc : IDisposable
     private const byte ReadCommand = 0x80;
     private const byte WriteCommand = 0x81;
     private const int HandshakeTimeoutMs = 100;
-    private const int MutexTimeoutMs = 500;
+    private const int MutexTimeoutMs = 2000;
 
     private readonly PawnIoModule _io;
     private readonly Mutex? _ecMutex;
@@ -44,8 +44,10 @@ internal sealed class AcpiEc : IDisposable
     {
         for (int attempt = 1; ; attempt++)
         {
-            Acquire();
+            // Raise priority BEFORE taking the shared mutex: at normal priority on a saturated CPU the
+            // holder can be preempted mid-transaction while other EC users time out waiting for it.
             ThreadPriority previous = RaisePriority();
+            Acquire();
             try
             {
                 DrainStaleOutput();
@@ -60,7 +62,7 @@ internal sealed class AcpiEc : IDisposable
             {
                 Retries++;
             }
-            finally { Thread.CurrentThread.Priority = previous; Release(); }
+            finally { Release(); Thread.CurrentThread.Priority = previous; }
             Thread.Sleep(2);
         }
     }
@@ -69,8 +71,10 @@ internal sealed class AcpiEc : IDisposable
     {
         for (int attempt = 1; ; attempt++)
         {
-            Acquire();
+            // Raise priority BEFORE taking the shared mutex: at normal priority on a saturated CPU the
+            // holder can be preempted mid-transaction while other EC users time out waiting for it.
             ThreadPriority previous = RaisePriority();
+            Acquire();
             try
             {
                 WaitUntil(() => (Status() & InputBufferFull) == 0, "input buffer to empty");
@@ -86,7 +90,7 @@ internal sealed class AcpiEc : IDisposable
             {
                 Retries++;
             }
-            finally { Thread.CurrentThread.Priority = previous; Release(); }
+            finally { Release(); Thread.CurrentThread.Priority = previous; }
             Thread.Sleep(2);
         }
     }

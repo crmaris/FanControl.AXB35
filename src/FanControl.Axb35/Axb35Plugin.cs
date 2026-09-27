@@ -156,11 +156,17 @@ internal sealed class Axb35FanControl : IPluginControlSensor2
     private static readonly TimeSpan Reassert = TimeSpan.FromSeconds(2);
     private DateTime _lastWrite = DateTime.MinValue;
 
+    // The board cannot hold BOTH fans at 100 % once the chip is hot: measured on a Bosgame M5 at 98 °C with all
+    // 32 threads loaded, one of the two fans collapses (to ~1,400-2,000 rpm, repeatedly), whichever it is. At
+    // 80 % both held ~4,000 rpm steadily - more total airflow than 100 % (8,000 vs 6,600 rpm combined) and far
+    // more than the stock firmware (~6,200). So FanControl's 81-100 % all mean 80 % on the EC.
+    internal const int MaxDuty = 80;
+
     public void Set(float val)
     {
-        // Round up: a fan never runs slower than FanControl asked for.
+        // Round up: a fan never runs slower than FanControl asked for (up to the MaxDuty ceiling).
         int duty = (int)Math.Ceiling(val - 1e-3);
-        duty = duty < 0 ? 0 : duty > 100 ? 100 : duty;
+        duty = duty < 0 ? 0 : duty > MaxDuty ? MaxDuty : duty;
         if (duty == _appliedDuty && DateTime.UtcNow - _lastWrite < Reassert)
             return; // FanControl calls Set every cycle; unchanged duties are re-written every 2 s only
         try
