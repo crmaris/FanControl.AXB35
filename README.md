@@ -149,7 +149,7 @@ side gave up after a second and logged ACPI event 13. Measured on the test unit:
 |---|---|
 | The five days before the plugin was installed | 0 |
 | 1.0.0 (ports only), three days | 3.3 |
-| 1.1.0 (BIOS WMI) | see the changelog |
+| 1.1.0 (BIOS WMI), first 3 h | 0 (about 10 expected at the 1.0.0 rate) |
 
 The timestamps give it away: within each cluster, the gaps between those events are whole multiples of the EC's
 ~10.2 s event period. Nothing important was lost on the M5. None of the BIOS's ACPI code reads the EC through the
@@ -213,7 +213,7 @@ and `src/axb35ctl/bin/Release/net48/axb35ctl.exe`.
 
 - **1.1.0**
   - Fans 1-2 and the temperature now go through the BIOS's WMI fan interface. That stops the ACPI event 13 timeouts
-    1.0.0 caused in the System log (about 3 an hour on the test unit).
+    1.0.0 caused in the System log: about 3 an hour on the test unit, and none in the first 3 hours after the update.
   - Port transactions now wait for an idle EC, give way to Windows' event queries, and no longer take someone else's
     byte.
   - Fan 3 is read every 30 s instead of every second while the WMI interface is in use.

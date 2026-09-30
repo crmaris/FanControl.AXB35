@@ -60,7 +60,8 @@ and duty to the BIOS's own WMI method, which reads and writes the memory-mapped 
 Ports remain only for the open-time checks, fan 3 every 30 s and release. Port transactions now require an idle EC
 (200 µs quiet, no SCI_EVT), give way if an event appears between bytes, and no longer drain another user's byte.
 A failed release now holds the fan at 80 % (MaxDuty). Measured after the swap: a 60 s sniff showed only Windows'
-event queries plus one fan-3 read every 30 s. The before/after event-13 counts are in the README table.
+event queries plus one fan-3 read every 30 s. ACPI event 13 went from 3.25/h in the previous 24 h to 0 in the
+first 3 h after the swap. The plugin logged 73 port transactions in its first 10 min, against ~8,400 for 1.0.0.
 
 ### 2026-09-27 — v1.0.0, first public release
 Written for, and measured on, a Bosgame M5, alongside the Hardware Busters article. The high-priority spin fix
