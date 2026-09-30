@@ -62,6 +62,9 @@ Ports remain only for the open-time checks, fan 3 every 30 s and release. Port t
 A failed release now holds the fan at 80 % (MaxDuty). Measured after the swap: a 60 s sniff showed only Windows'
 event queries plus one fan-3 read every 30 s. ACPI event 13 went from 3.25/h in the previous 24 h to 0 in the
 first 3 h after the swap. The plugin logged 73 port transactions in its first 10 min, against ~8,400 for 1.0.0.
+Merged as #1 (fast-forward, main `e43850e`) and released as **v1.1.0**, tagged at `e43850e`. Zip
+`FanControl.AXB35-1.1.0.zip` SHA-256 `944b7706…d06d0ed` (GitHub's asset digest matches), net48 DLL `ec1ea792…`,
+net8.0-windows DLL `d6699a10…`. The test unit runs that release DLL, with 0 event 13 after 4.3 h.
 
 ### 2026-09-27 — v1.0.0, first public release
 Written for, and measured on, a Bosgame M5, alongside the Hardware Busters article. The high-priority spin fix
