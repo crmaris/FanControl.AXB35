@@ -8,8 +8,14 @@ which LibreHardwareMonitor, and therefore Fan Control, does not support. The sto
 sustained load, so the chip sits in the high 80s and 90s °C. This plugin gives Fan Control the EC's temperature
 sensor, the RPM of all three fans, and full 0-100 % control of fans 1 and 2. You can then run any curve you like.
 
-It talks to the EC through **PawnIO**, the signed driver Fan Control itself installs. **Secure Boot and Memory
-Integrity (HVCI) stay on**, and there is no WinRing0 and no test-signing.
+It reads and holds the fans through the **BIOS's own WMI fan interface**, and uses **PawnIO**, the signed driver Fan
+Control itself installs, for the few things that interface cannot do. **Secure Boot and Memory Integrity (HVCI) stay
+on**, and there is no WinRing0 and no test-signing.
+
+> **Upgrade from 1.0.0.** Version 1.0.0 talked to the EC only through its ports 0x62/0x66. Windows' own EC driver uses
+> the same ports, so about three times an hour the two collided and Windows logged *ACPI event 13, "The embedded
+> controller (EC) did not respond within the specified timeout period"* in the System log. 1.1.0 moves the regular
+> traffic to the BIOS interface, which cannot collide. See [How it works](#how-it-works).
 
 Background and measurements: [Bosgame M5 Fan Control: Broken as Shipped, So I Fixed It With a Free Plugin](https://hwbusters.com/systems/bosgame-m5-fan-control-broken-as-shipped-so-i-fixed-it-with-a-free-plugin/) (Hardware Busters).
 
@@ -20,6 +26,7 @@ Background and measurements: [Bosgame M5 Fan Control: Broken as Shipped, So I Fi
 | Tested | Bosgame M5 / BeyondMax, board `AXB35-02`, BIOS 3.11, Windows 11 25H2, Performance mode |
 | Probably | Other Sixunited AXB35 machines (GMKtec EVO-X2, FEVM FA-EX9 ...). **Untested.** See the safety checks below |
 | Fan Control | V238 or newer (earlier versions do not ship PawnIO). Tested on V281, both the .NET 10 and .NET Framework 4.8 builds |
+| BIOS WMI | The M5's BIOS 3.11 has it (`root\wmi:PowerSwitchInterface`). Without it the plugin falls back to the EC ports, and says so in the log |
 
 The plugin **refuses to write to the EC** unless all of these hold:
 - Windows reports an `AXB35` baseboard;
@@ -106,15 +113,50 @@ axb35ctl hold all 100 60         hold fans 1-2 at 100 % for 60 s, re-writing eve
 axb35ctl release all             hand fans 1 and 2 back to the firmware
 axb35ctl log 600 temps.csv       one CSV line a second: EC and GPU temperature, RPM and duty
 axb35ctl dump                    read-only dump of the EC's 256 registers
+axb35ctl sniff 60 ec.csv         read-only: watch the EC status port for 60 s and list who else talks to the EC
+axb35ctl --ports status          any command, forced onto the EC ports even where the BIOS WMI interface exists
 ```
 
 Do not run `set` or `release` while Fan Control is controlling the fans; the two will fight.
 
 ## How it works
 
-The Bosgame M5 EC is reached through the standard ACPI EC ports (0x62 data, 0x66 command). The plugin loads PawnIO's
-signed `LpcACPIEC` module, which allows exactly those two ports, and speaks the ACPI EC read/write protocol from user
-mode. It takes the shared `Global\Access_EC` mutex that LibreHardwareMonitor and HWiNFO use.
+There are two ways into this EC, and the plugin uses both:
+
+1. **The BIOS's WMI fan interface** (preferred). The M5's BIOS has an ACPI-WMI device (`\_SB.WMIB`, WMI class
+   `root\wmi:PowerSwitchInterface`, GUID `99D89064-8D50-42BB-BEA9-155B2E5D0FCD`) whose methods set a fan's duty, read
+   both fan speeds and read the EC temperature. Its ACPI code reaches the EC's RAM through the EC's **memory window**
+   (`0xFEC40400`, same offsets as the registers below), not through the port handshake. The plugin calls it through
+   Windows' WMI data-block API (`WmiExecuteMethod`), well under a millisecond per call, with no WMI service or COM in
+   between. It writes only what the BIOS's own method writes: `0x80 | duty` into the fan's duty register.
+2. **The EC ports** 0x62 (data) and 0x66 (command/status), through PawnIO's signed `LpcACPIEC` module, which allows
+   exactly those two ports. The plugin speaks the ACPI EC read/write protocol from user mode, under the shared
+   `Global\Access_EC` mutex that LibreHardwareMonitor and HWiNFO use. With the WMI interface present, the ports are
+   used only for:
+   - the checks when the plugin opens, including that the WMI interface and the ports see the same temperature and
+     fan speed;
+   - fan 3's speed, every 30 s (the WMI interface has no reading for it);
+   - handing a fan back to the firmware (`0x00`), which the WMI interface cannot do.
+
+**Why not just the ports.** Windows' own ACPI EC driver uses the same two ports to answer the EC's events, and it does
+not take `Global\Access_EC` or any other lock a program can share. On the M5 the EC raises an event every ~10.2 s
+(it runs the BIOS method `_Q49`), and Windows answers it with a ~1 ms query on the ports. Version 1.0.0 did all its
+reading and writing on the ports: a 16-24 ms burst of transactions every Fan Control cycle (~1 s). About 2 % of the
+EC's events landed inside a burst. The two conversations then interleaved, and about half of those times Windows'
+side gave up after a second and logged ACPI event 13. Measured on the test unit:
+
+| | ACPI event 13 per hour |
+|---|---|
+| The five days before the plugin was installed | 0 |
+| 1.0.0 (ports only), three days | 3.3 |
+| 1.1.0 (BIOS WMI) | see the changelog |
+
+The timestamps give it away: within each cluster, the gaps between those events are whole multiples of the EC's
+~10.2 s event period. Nothing important was lost on the M5. None of the BIOS's ACPI code reads the EC through the
+ports, and the periodic `_Q49` event only raises a vendor WMI event that nothing listens to. But the same collision
+could swallow a rarer event: the power button (`_Q54`), the power-mode key (`_Q46`), or a thermal-table change (`_Q74`).
+
+`axb35ctl sniff` shows all of this. It samples the status port read-only and lists who else is talking to the EC.
 
 | EC register | Meaning |
 |---|---|
@@ -125,6 +167,10 @@ mode. It takes the shared `Global\Access_EC` mutex that LibreHardwareMonitor and
 | `0x31` | Power-mode byte, displayed only and never written |
 
 Details that matter:
+- **Port transactions give way.** A port transaction starts only when the status port shows no one else mid-transaction:
+  both buffers empty, no event pending, and still so 200 µs later. If an event appears between two of its bytes, it
+  stops and retries rather than finishing across Windows' query. A byte already waiting in the output buffer is left
+  for its owner. 1.0.0 read it out of the way, which guaranteed the other side's timeout.
 - **Polling.** Windows' own EC driver shares these ports and services the EC's answer-ready interrupt, so a reader
   that is off-CPU at that moment loses the byte. The plugin polls at Highest thread priority, without sleeping or
   yielding, and retries every transaction up to five times. With `Thread.Yield()` every read failed once all 32 CPU
@@ -134,9 +180,11 @@ Details that matter:
 - **Lock order.** Thread priority is raised *before* the shared EC mutex is taken, so a holder is never preempted
   mid-transaction on a saturated CPU while other EC users wait for it.
 - **80 % cap.** See the table above.
-- **Verified writes.** Every write is read back.
-- **Release.** When Fan Control stops or releases a fan, the plugin writes `0x00` and the fan goes back to the
-  firmware's own curve. This was measured: after 100 % the fans decayed back to their firmware speed.
+- **Checked writes.** A port write is read back. A WMI write is acknowledged by the BIOS method, which refuses
+  anything above 101 %; the WMI interface has no way to read the duty back.
+- **Release.** When Fan Control stops or releases a fan, the plugin writes `0x00` over the ports and the fan goes back
+  to the firmware's own curve. This was measured: after 100 % the fans decayed back to their firmware speed. If that
+  write ever fails, the plugin holds the fan at 80 % instead, so an unattended fan fails loud rather than hot.
 
 ## Uninstall
 
@@ -146,7 +194,7 @@ on firmware control, because the plugin releases them on exit.
 ## Safety
 
 This writes to your machine's embedded controller. The plugin only writes the two fan duty registers, only after
-the checks above pass, and verifies every write. The realistic failure is a fan left at a fixed duty until you
+the checks above pass, and checks every write. The realistic failure is a fan left at a fixed duty until you
 release it or reboot. **No warranty. Use at your own risk.**
 
 Never set a low duty on a loaded machine. The chip protects itself by throttling, but that is exactly what this plugin
@@ -160,6 +208,20 @@ dotnet build -c Release
 
 Needs the .NET 8+ SDK. It produces `src/FanControl.Axb35/bin/Release/{net48,net8.0-windows}/FanControl.Axb35.dll`
 and `src/axb35ctl/bin/Release/net48/axb35ctl.exe`.
+
+## Changelog
+
+- **1.1.0**
+  - Fans 1-2 and the temperature now go through the BIOS's WMI fan interface. That stops the ACPI event 13 timeouts
+    1.0.0 caused in the System log (about 3 an hour on the test unit).
+  - Port transactions now wait for an idle EC, give way to Windows' event queries, and no longer take someone else's
+    byte.
+  - Fan 3 is read every 30 s instead of every second while the WMI interface is in use.
+  - If a release fails, the fan is held at 80 %.
+  - New in `axb35ctl`: `sniff`, `--ports`, and a transport line in `status`. Fan Control's log gets a traffic summary
+    10 minutes after start and then daily.
+  - Sensor and control identifiers are unchanged, so saved curves keep working.
+- **1.0.0** First release.
 
 ## Credits
 

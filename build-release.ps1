@@ -1,7 +1,7 @@
 # Builds the release zip: both plugin builds, axb35ctl, the docs and a SHA256SUMS file, into dist\.
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
-$version = '1.0.0'
+$version = '1.1.0'
 dotnet build -c Release | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'build failed' }
 

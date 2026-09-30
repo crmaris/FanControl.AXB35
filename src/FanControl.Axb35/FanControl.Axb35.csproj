@@ -11,8 +11,8 @@
     <Nullable>enable</Nullable>
     <AssemblyName>FanControl.Axb35</AssemblyName>
     <RootNamespace>FanControl.Axb35</RootNamespace>
-    <Version>1.0.0</Version>
-    <Description>FanControl plugin for the ITE IT5570E EC on Sixunited AXB35 boards (Bosgame M5), via PawnIO</Description>
+    <Version>1.1.0</Version>
+    <Description>FanControl plugin for the ITE IT5570E EC on Sixunited AXB35 boards (Bosgame M5), via the BIOS WMI interface and PawnIO</Description>
     <Authors>Hardware Busters</Authors>
     <Deterministic>true</Deterministic>
     <PathMap>$(MSBuildProjectDirectory)=/_/</PathMap>

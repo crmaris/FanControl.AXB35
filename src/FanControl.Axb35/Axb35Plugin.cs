@@ -6,10 +6,11 @@ namespace FanControl.Axb35;
 
 /// <summary>
 /// FanControl plugin for the ITE IT5570E embedded controller of the Bosgame M5 / BeyondMax
-/// (Sixunited AXB35-02), which LibreHardwareMonitor does not drive. Talks to it through PawnIO's
-/// signed LpcACPIEC module. Exposes the EC temperature, the RPM of fans 1-3, and fans 1 and 2 as
-/// controls (0-100 %). A fan FanControl releases, or every fan when FanControl closes, goes back
-/// to the firmware (duty register 0x00, its boot value).
+/// (Sixunited AXB35-02), which LibreHardwareMonitor does not drive. Reads and holds the fans through the BIOS's own
+/// WMI interface where it exists (memory-mapped EC RAM, no EC-port handshake), otherwise through PawnIO's signed
+/// LpcACPIEC module. Exposes the EC temperature, the RPM of fans 1-3, and fans 1 and 2 as controls (0-100 %). A fan
+/// FanControl releases, or every fan when FanControl closes, goes back to the firmware (duty register 0x00, its boot
+/// value).
 /// </summary>
 public sealed class Axb35Plugin : IPlugin2
 {
@@ -19,10 +20,21 @@ public sealed class Axb35Plugin : IPlugin2
     // PluginName or an Id orphans every saved curve that uses it.
     internal const string PluginName = "AXB35 EC";
 
+    // Fan 3 has no BIOS WMI reading, so with that interface in use it is the only regular EC-port traffic left: read it
+    // every 30 s (3 short transactions), not every cycle. It is a monitoring value only; it has no control register.
+    // (On the test unit it reads 0 when cool and ~700 rpm under load, so it cannot be skipped when it reads 0.)
+    private static readonly TimeSpan Fan3IntervalWithWmi = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan FirstStats = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan StatsInterval = TimeSpan.FromHours(24);
+
     private readonly Axb35Sensor _temperature = new("ec/temperature", "AXB35 EC temperature");
     private readonly Axb35Sensor[] _rpm = new Axb35Sensor[Axb35Board.FanCount];
     private readonly Axb35FanControl[] _controls = new Axb35FanControl[Axb35Board.ControllableFans];
     private Axb35Board? _board;
+    private DateTime _nextFan3 = DateTime.MinValue;
+    private DateTime _nextStats = DateTime.MaxValue;
+    private long _updates;
+    private bool _usedBiosWmi;
     private DateTime _lastErrorLogged = DateTime.MinValue;
 
     public Axb35Plugin(IPluginLogger logger)
@@ -43,7 +55,9 @@ public sealed class Axb35Plugin : IPlugin2
         try
         {
             _board = Axb35Board.Open();
-            Log($"EC opened on {Axb35Board.BoardDescription()}; {_board.ReadTemperature()} C");
+            Log($"EC opened on {Axb35Board.BoardDescription()}; {_board.ReadTemperature()} C; through {_board.Transport}");
+            _usedBiosWmi = _board.UsesBiosWmi;
+            _nextStats = DateTime.UtcNow + FirstStats;
         }
         catch (Exception ex)
         {
@@ -71,12 +85,32 @@ public sealed class Axb35Plugin : IPlugin2
         try
         {
             _temperature.Value = board.ReadTemperature();
-            for (int fan = 0; fan < Axb35Board.FanCount; fan++)
+            for (int fan = 0; fan < Axb35Board.ControllableFans; fan++)
             {
                 FanReading reading = board.ReadFan(fan);
                 _rpm[fan].Value = reading.Rpm;
-                if (fan < Axb35Board.ControllableFans)
-                    _controls[fan].Observe(reading);
+                _controls[fan].Observe(reading);
+            }
+            if (DateTime.UtcNow >= _nextFan3)
+            {
+                // Scheduled before the read, so a fan-3 read that keeps failing costs one attempt per interval, not one
+                // per cycle (each holds the board while it retries, which would delay the fan 1-2 re-assert).
+                _nextFan3 = board.UsesBiosWmi ? DateTime.UtcNow + Fan3IntervalWithWmi : DateTime.MinValue;
+                try { _rpm[2].Value = board.ReadFan(2).Rpm; }
+                catch (Exception ex) { LogThrottled("fan 3 read failed: " + ex.Message); }
+            }
+            if (_usedBiosWmi && !board.UsesBiosWmi)
+            {
+                _usedBiosWmi = false;
+                Log("switched to " + board.Transport);
+            }
+            _updates++;
+            if (DateTime.UtcNow >= _nextStats)
+            {
+                _nextStats = DateTime.UtcNow + StatsInterval;
+                Log($"since start: {_updates} updates, {board.WmiCalls} BIOS WMI calls, {board.EcTransactions} EC-port transactions " +
+                    $"({board.EcDeferrals} waited for another EC user, {board.EcRetries} retried)" +
+                    (board.EcIgnoredStatusBits != 0 ? $"; this EC rests with status bits 0x{board.EcIgnoredStatusBits:X2}" : ""));
             }
         }
         catch (Exception ex)
@@ -91,12 +125,36 @@ public sealed class Axb35Plugin : IPlugin2
         _board = null;
         if (board is null)
             return;
+        board.StopHolding();
         for (int fan = 0; fan < Axb35Board.ControllableFans; fan++)
-        {
-            try { board.Release(fan); }
-            catch (Exception ex) { Log($"fan {fan + 1}: could not hand back to the firmware: {ex.Message}"); }
-        }
+            ReleaseFan(board, fan, logSuccess: false);
         board.Dispose();
+    }
+
+    // The one bad way out is a fan left held at the duty the curve last asked for, with nothing re-asserting it: at
+    // idle that duty is low. If the hand-back fails, hold the fan at MaxDuty instead, so it fails loud rather than hot
+    // (and if the EC takes it back later, it goes to the firmware curve).
+    internal void ReleaseFan(Axb35Board board, int fan, bool logSuccess)
+    {
+        try
+        {
+            board.Release(fan);
+            if (logSuccess)
+                Log($"fan {fan + 1}: released to the firmware");
+        }
+        catch (Exception ex)
+        {
+            Log($"fan {fan + 1}: could not hand back to the firmware: {ex.Message}");
+            try
+            {
+                board.HoldAfterFailedRelease(fan, Axb35FanControl.MaxDuty);
+                Log($"fan {fan + 1}: held at {Axb35FanControl.MaxDuty}% instead");
+            }
+            catch (Exception fallback)
+            {
+                Log($"fan {fan + 1}: could not hold it at {Axb35FanControl.MaxDuty}% either: {fallback.Message}");
+            }
+        }
     }
 
     internal void Log(string message) => _logger.Log($"[{Name}] {message}");
@@ -190,17 +248,12 @@ internal sealed class Axb35FanControl : IPluginControlSensor2
 
     public void Reset()
     {
-        try
-        {
-            _plugin.Board?.Release(_fan);
-        }
-        catch (Exception ex)
-        {
-            _plugin.Log($"fan {_fan + 1}: could not hand back to the firmware: {ex.Message}");
-        }
+        Axb35Board? board = _plugin.Board;
+        if (board is not null)
+            _plugin.ReleaseFan(board, _fan, logSuccess: true);
         _appliedDuty = -1;
         _announced = false;
-        _plugin.Log($"fan {_fan + 1}: released to the firmware");
+        Value = null;
     }
 
     public void Update()
@@ -210,6 +263,9 @@ internal sealed class Axb35FanControl : IPluginControlSensor2
 
     internal void Observe(FanReading reading)
     {
+        // Read through the BIOS WMI interface there is no duty to compare; the 2 s re-assert covers an EC reset.
+        if (!reading.DutyKnown)
+            return;
         // If the EC no longer holds what we set (EC reset, resume), forget it so the next Set re-applies.
         if (!reading.Manual || reading.Duty != _appliedDuty)
             _appliedDuty = -1;

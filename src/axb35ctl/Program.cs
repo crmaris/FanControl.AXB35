@@ -14,19 +14,31 @@ namespace Axb35Ctl;
 internal static class Program
 {
     private const string Usage = """
-        axb35ctl status                      temperature, power mode, fans 1-3 (duty, RPM)
+        axb35ctl [--ports] <command>         --ports: use the EC ports even where the BIOS WMI interface exists
+        axb35ctl status                      temperature, power mode, fans 1-3 (duty, RPM), transport
         axb35ctl watch [seconds]             status once a second (default 30 s)
         axb35ctl set <1|2|all> <0-100>       set fan 1 and/or 2 to a duty % once (the EC may take it back)
         axb35ctl hold <1|2|all> <0-100> <s>  hold a duty for <s> seconds, re-writing it every 2 s, then release
         axb35ctl release <1|2|all>           hand fan 1 and/or 2 back to the firmware (0x00)
         axb35ctl dump                        read-only dump of EC RAM 0x00-0xFF, twice, changes marked *
+        axb35ctl sniff <seconds> [file.csv]  read-only: watch the EC status port and report who else talks to the EC
         axb35ctl log <seconds> <file.csv> [--guard <C>]
                                              one CSV line a second: EC and GPU temperature, fan RPM and duty.
                                              --guard: if the EC reaches <C>, hold fans 1 and 2 at 100 %
         """;
 
+    // Ctrl+C ends watch / hold / log through their normal exit, so a held fan is still released.
+    private static volatile bool _cancelled;
+
     private static int Main(string[] args)
     {
+        Console.CancelKeyPress += (_, e) =>
+        {
+            e.Cancel = true;
+            _cancelled = true;
+        };
+        bool useBiosWmi = !args.Contains("--ports", StringComparer.OrdinalIgnoreCase);
+        args = args.Where(a => !a.Equals("--ports", StringComparison.OrdinalIgnoreCase)).ToArray();
         string command = args.Length > 0 ? args[0].ToLowerInvariant() : "status";
         try
         {
@@ -38,9 +50,12 @@ internal static class Program
                 case "dump":
                     Dump();
                     return 0;
+                case "sniff" when args.Length >= 2:
+                    Sniffer.Run(double.Parse(args[1], CultureInfo.InvariantCulture), args.Length > 2 ? args[2] : null);
+                    return 0;
             }
 
-            using Axb35Board board = Axb35Board.Open();
+            using Axb35Board board = Axb35Board.Open(useBiosWmi);
             switch (command)
             {
                 case "status":
@@ -48,7 +63,7 @@ internal static class Program
                     return 0;
                 case "watch":
                     int seconds = args.Length > 1 ? int.Parse(args[1], CultureInfo.InvariantCulture) : 30;
-                    for (int i = 0; i < seconds; i++)
+                    for (int i = 0; i < seconds && !_cancelled; i++)
                     {
                         PrintLine(board);
                         Thread.Sleep(1000);
@@ -75,7 +90,7 @@ internal static class Program
                     int holdSeconds = int.Parse(args[3], CultureInfo.InvariantCulture);
                     try
                     {
-                        for (int i = 0; i < holdSeconds; i++)
+                        for (int i = 0; i < holdSeconds && !_cancelled; i++)
                         {
                             if (i % 2 == 0)
                                 foreach (int fan in holdFans)
@@ -86,8 +101,7 @@ internal static class Program
                     }
                     finally
                     {
-                        foreach (int fan in holdFans)
-                            board.Release(fan);
+                        ReleaseOrFailSafe(board, holdFans);
                     }
                     return 0;
                 case "release" when args.Length == 2:
@@ -115,17 +129,21 @@ internal static class Program
         for (int fan = 0; fan < Axb35Board.FanCount; fan++)
         {
             FanReading f = board.ReadFan(fan);
-            string control = !f.Controllable ? "no control register" : f.Manual ? $"held at {f.Duty}%" : "firmware";
+            if (f.Controllable && !f.DutyKnown)
+                f.DutyRaw = board.ReadDutyRegister(fan).DutyRaw; // the WMI interface has no duty getter: ask the port
+            bool manual = (f.DutyRaw & 0x80) != 0;
+            string control = !f.Controllable ? "no control register" : manual ? $"held at {f.DutyRaw & 0x7F}%" : "firmware";
             Console.WriteLine($"fan {fan + 1}        {f.Rpm,5} rpm   {control}" + (f.Controllable ? $"   (raw 0x{f.DutyRaw:X2})" : ""));
         }
-        Console.WriteLine($"EC retries   {board.EcRetries}");
+        Console.WriteLine($"transport    {board.Transport}");
+        Console.WriteLine($"EC ports     {board.EcTransactions} transactions, {board.EcDeferrals} waited for another EC user, {board.EcRetries} retried");
     }
 
     private static void PrintLine(Axb35Board board)
     {
         var fans = Enumerable.Range(0, Axb35Board.FanCount).Select(board.ReadFan).ToList();
         Console.WriteLine($"{DateTime.Now:HH:mm:ss}  {board.ReadTemperature(),3} C  " +
-                          string.Join("  ", fans.Select(f => $"fan{f.Fan + 1} {f.Rpm,5} rpm {(f.Controllable ? f.Manual ? $"{f.Duty,3}%" : "fw  " : "    ")}")));
+                          string.Join("  ", fans.Select(f => $"fan{f.Fan + 1} {f.Rpm,5} rpm {(!f.Controllable ? "    " : !f.DutyKnown ? "    " : f.Manual ? $"{f.Duty,3}%" : "fw  ")}")));
     }
 
     // Each line is flushed through to disk, so the last reading before a freeze or power loss survives.
@@ -137,38 +155,65 @@ internal static class Program
         if (file.Length == 0)
             writer.WriteLine("utc,ec_c,gpu_c,fan1_rpm,fan2_rpm,fan3_rpm,fan1_duty,fan2_duty,note");
         var clock = System.Diagnostics.Stopwatch.StartNew();
-        for (int i = 0; i < seconds; i++)
+        try
         {
-            string note = "";
+            for (int i = 0; i < seconds && !_cancelled; i++)
+            {
+                string note = "";
+                try
+                {
+                    int ec = board.ReadTemperature();
+                    double? gpu = GpuTemperature.Read();
+                    var fans = Enumerable.Range(0, Axb35Board.FanCount).Select(board.ReadFan).ToList();
+                    if (guardCelsius is int limit && ec >= limit && !guardFired)
+                    {
+                        guardFired = true;
+                        note = $"GUARD {ec}C: fans 1-2 to 100%";
+                    }
+                    if (guardFired && i % 2 == 0)
+                    {
+                        board.SetDuty(0, 100); // re-asserted: the EC takes a held fan back on its own
+                        board.SetDuty(1, 100);
+                    }
+                    string Duty(FanReading f) => !f.DutyKnown ? "" : f.Manual ? f.Duty.ToString() : "fw";
+                    writer.WriteLine(string.Join(",", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"), ec,
+                        gpu?.ToString("0.0", CultureInfo.InvariantCulture) ?? "", fans[0].Rpm, fans[1].Rpm, fans[2].Rpm,
+                        Duty(fans[0]), Duty(fans[1]), note));
+                }
+                catch (EcException ex)
+                {
+                    writer.WriteLine($"{DateTime.UtcNow:yyyy-MM-ddTHH:mm:ssZ},,,,,,,,read failed: {ex.Message.Replace(',', ';')}");
+                }
+                writer.Flush();
+                file.Flush(true);
+                int wait = (i + 1) * 1000 - (int)clock.ElapsedMilliseconds;
+                if (wait > 0)
+                    Thread.Sleep(wait);
+            }
+        }
+        finally
+        {
+            if (guardFired)
+                ReleaseOrFailSafe(board, new[] { 0, 1 });
+        }
+    }
+
+    // Each fan on its own, so one failed release cannot leave the other held. A fan that cannot be handed back is
+    // held at 80 % rather than left at whatever duty it had.
+    private static void ReleaseOrFailSafe(Axb35Board board, IEnumerable<int> fans)
+    {
+        foreach (int fan in fans)
+        {
             try
             {
-                int ec = board.ReadTemperature();
-                double? gpu = GpuTemperature.Read();
-                var fans = Enumerable.Range(0, Axb35Board.FanCount).Select(board.ReadFan).ToList();
-                if (guardCelsius is int limit && ec >= limit && !guardFired)
-                {
-                    guardFired = true;
-                    note = $"GUARD {ec}C: fans 1-2 to 100%";
-                }
-                if (guardFired && i % 2 == 0)
-                {
-                    board.SetDuty(0, 100); // re-asserted: the EC takes a held fan back on its own
-                    board.SetDuty(1, 100);
-                }
-                string Duty(FanReading f) => f.Manual ? f.Duty.ToString() : "fw";
-                writer.WriteLine(string.Join(",", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"), ec,
-                    gpu?.ToString("0.0", CultureInfo.InvariantCulture) ?? "", fans[0].Rpm, fans[1].Rpm, fans[2].Rpm,
-                    Duty(fans[0]), Duty(fans[1]), note));
+                board.Release(fan);
             }
             catch (EcException ex)
             {
-                writer.WriteLine($"{DateTime.UtcNow:yyyy-MM-ddTHH:mm:ssZ},,,,,,,,read failed: {ex.Message.Replace(',', ';')}");
+                Console.Error.WriteLine($"axb35ctl: fan {fan + 1}: release failed ({ex.Message}); holding it at 80 %");
+                try { board.HoldAfterFailedRelease(fan, 80); }
+                catch (EcException again) { Console.Error.WriteLine($"axb35ctl: fan {fan + 1}: that failed too: {again.Message}"); }
             }
-            writer.Flush();
-            file.Flush(true);
-            int wait = (i + 1) * 1000 - (int)clock.ElapsedMilliseconds;
-            if (wait > 0)
-                Thread.Sleep(wait);
         }
     }
 

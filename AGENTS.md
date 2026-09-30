@@ -8,3 +8,5 @@ Read **`CLAUDE.md`** first; it is the canonical developer notes for this public 
 3. The plugin `Name` (`AXB35 EC`) and the sensor Ids are part of users' saved Fan Control configs. Never rename
    them.
 4. Only EC registers 0x33 and 0x34 are ever written, and only after the board and layout checks pass.
+5. Regular traffic goes through the BIOS WMI interface (memory-mapped EC RAM). Keep EC-port traffic to the open-time
+   checks, fan 3 and release: Windows' EC driver shares those ports with no shareable lock (ACPI event 13).
